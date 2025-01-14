@@ -13,10 +13,10 @@
 #include <thread>
 #include <unistd.h>
 
-#define MAX_EVENTS 10
+#define EPOLL_EVENTS 1
 
-#define LOG_LINE(pid, fmtString, ...)                                          \
-  std::printf("[%d]: " fmtString "\n", pid __VA_OPT__(, ) __VA_ARGS__);
+#define LOG_LINE(PROC_ID, fmtString, ...)                                      \
+  std::printf("[%d]: " fmtString "\n", PROC_ID __VA_OPT__(, ) __VA_ARGS__);
 
 static bool KeepRunning = true;
 
@@ -34,7 +34,8 @@ constexpr auto IsPtraceEvent(int stopstatus,
 
 void LogWaitStatus(WaitResult wait) {
   if (WIFEXITED(wait.status)) {
-    LOG_LINE(wait.pid, "Child exited with status %d\n", WEXITSTATUS(wait.status));
+    LOG_LINE(wait.pid, "Child exited with status %d\n",
+             WEXITSTATUS(wait.status));
   } else if (WIFSIGNALED(wait.status)) {
     LOG_LINE(wait.pid, "Child killed by signal %d (%s)", WTERMSIG(wait.status),
              strsignal(WTERMSIG(wait.status)));
@@ -47,8 +48,13 @@ void LogWaitStatus(WaitResult wait) {
       LOG_LINE(wait.pid, "PTRACE_EVENT_VFORK");
     } else if (IsPtraceEvent(wait.status, PTRACE_EVENT_CLONE)) {
       pid_t new_child = 0;
-      auto result = ptrace(PTRACE_GETEVENTMSG, wait.pid, nullptr, &new_child);
-      LOG_LINE(wait.pid, "PTRACE_EVENT_CLONE: new child %d", new_child);
+      // interestingly, on my machine, unless I place waitedPid here, the call
+      // to ptrace(PTRACE_GETEVENTMSG, ...) clobbers waitPid value lol :'D.
+      // Gotta love ptrace. If you want a good laugh place `waitedPid =
+      // wait.pid` at the very top of the function.
+      auto waitedPid = wait.pid;
+      auto result = ptrace(PTRACE_GETEVENTMSG, waitedPid, nullptr, &new_child);
+      LOG_LINE(waitedPid, "PTRACE_EVENT_CLONE: new child %d", new_child);
     } else if (IsPtraceEvent(wait.status, PTRACE_EVENT_EXEC)) {
       LOG_LINE(wait.pid, "PTRACE_EVENT_EXEC");
     } else if (IsPtraceEvent(wait.status, PTRACE_EVENT_EXIT)) {
@@ -103,7 +109,7 @@ void WaitStatusReaderThread() {
     _exit(EXIT_FAILURE);
   }
 
-  struct epoll_event ev, events[MAX_EVENTS];
+  struct epoll_event ev, events[EPOLL_EVENTS];
   ev.events = EPOLLIN;
   ev.data.fd = sfd;
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev) == -1) {
@@ -114,7 +120,7 @@ void WaitStatusReaderThread() {
   bool init = false;
 
   while (KeepRunning) {
-    int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 5);
+    int nfds = epoll_wait(epoll_fd, events, EPOLL_EVENTS, 5);
     if (nfds == -1) {
       if (errno == EINTR)
         continue;
@@ -138,7 +144,7 @@ void WaitStatusReaderThread() {
           while ((pid = waitpid(-1, &status, __WALL | WNOHANG)) > 0) {
 
             WaitResult result{.pid = pid, .status = status};
-            if(write(Pipe[1], &result, sizeof(result)) == -1) {
+            if (write(Pipe[1], &result, sizeof(result)) == -1) {
               perror("Failed to write wait event");
               _exit(EXIT_FAILURE);
             }
@@ -195,7 +201,9 @@ int main(int argc, char *argv[]) {
   bool init = false;
   while (expectedExits > 0) {
     WaitResult waitResult;
-    if (read(Pipe[0], &waitResult, sizeof(waitResult)) == -1) {
+    int readRes = 0;
+    if (readRes = read(Pipe[0], &waitResult, sizeof(waitResult));
+        readRes == -1 || readRes != sizeof(WaitResult)) {
       perror("Failed to read from pipe");
       exit(EXIT_FAILURE);
     }
